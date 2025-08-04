@@ -216,12 +216,20 @@ elseif(CONFIG_BOARD_TYPE_LABPLUS_LEDONG_V2)
     set(BOARD_TYPE "labplus-ledong-v2") 
 elseif(CONFIG_BOARD_TYPE_SURFER_C3_1_14TFT)
     set(BOARD_TYPE "surfer-c3-1.14tft")
+elseif(CONFIG_BOARD_TYPE_LUKI_L1)
+    set(BOARD_TYPE "Luki-L1")
 endif()
 file(GLOB BOARD_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_TYPE}/*.cc
     ${CMAKE_CURRENT_SOURCE_DIR}/boards/${BOARD_TYPE}/*.c
 )
 list(APPEND SOURCES ${BOARD_SOURCES})
+
+# 启用 GIF 表情时添加 GIF 源文件
+# if(CONFIG_BOARD_TYPE_LUKI_L1)
+file(GLOB GIF_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/assets/gif/*.c)
+list(APPEND SOURCES ${GIF_SOURCES})
+# endif()
 
 if(CONFIG_USE_AUDIO_PROCESSOR)
     list(APPEND SOURCES "audio/processors/afe_audio_processor.cc")
