@@ -65,6 +65,9 @@ private:
     void SetChatMessageSync(const char* role, const char* content);
     void SetIconSync(const char* icon);
     
+    // 解析OTA进度消息并在状态栏显示
+    bool ParseAndDisplayOTAProgress(const char* content);
+    
     // 显示刷新线程相关
     static void DisplayRefreshTask(void* pvParameters);
     void ProcessDisplayUpdates();

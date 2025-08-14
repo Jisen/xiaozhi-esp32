@@ -376,7 +376,19 @@ void CustomEmojiDisplay::SetChatMessageSync(const char* role, const char* conten
         return;
     }
 
-    lv_label_set_text(chat_message_label_, content);
+    // 检测是否为OTA进度消息，如果是则同时在状态栏显示
+    if (role && strcmp(role, "system") == 0) {
+        if (ParseAndDisplayOTAProgress(content)) {
+            // 如果是OTA进度消息，已经在状态栏显示了，这里显示更详细的信息
+            std::string detailed_message = "固件升级中...\n" + std::string(content);
+            lv_label_set_text(chat_message_label_, detailed_message.c_str());
+        } else {
+            lv_label_set_text(chat_message_label_, content);
+        }
+    } else {
+        lv_label_set_text(chat_message_label_, content);
+    }
+    
     lv_obj_clear_flag(chat_message_label_, LV_OBJ_FLAG_HIDDEN);
 
     ESP_LOGI(TAG, "设置聊天消息 [%s]: %s", role, content);
@@ -404,4 +416,39 @@ void CustomEmojiDisplay::SetIconSync(const char* icon) {
 
         ESP_LOGI(TAG, "设置图标: %s", icon);
     }
+}
+
+// 解析OTA进度消息并在状态栏显示
+bool CustomEmojiDisplay::ParseAndDisplayOTAProgress(const char* content) {
+    if (!content || !status_label_) {
+        return false;
+    }
+
+    // 检查是否为OTA进度消息格式 "XX% YYKB/s" 或 "XX%"
+    int progress = 0;
+    unsigned int speed_kb = 0;
+    
+    // 尝试解析包含速度的格式 "XX% YYKB/s"
+    if (sscanf(content, "%d%% %uKB/s", &progress, &speed_kb) == 2) {
+        char status_text[32];
+        snprintf(status_text, sizeof(status_text), "升级中 %d%%", progress);
+        lv_label_set_text(status_label_, status_text);
+        lv_obj_clear_flag(status_label_, LV_OBJ_FLAG_HIDDEN);
+        
+        ESP_LOGI(TAG, "在状态栏显示OTA进度: %d%%", progress);
+        return true;
+    }
+    
+    // 尝试解析只有进度的格式 "XX%"
+    if (sscanf(content, "%d%%", &progress) == 1 && progress >= 0 && progress <= 100) {
+        char status_text[32];
+        snprintf(status_text, sizeof(status_text), "升级中 %d%%", progress);
+        lv_label_set_text(status_label_, status_text);
+        lv_obj_clear_flag(status_label_, LV_OBJ_FLAG_HIDDEN);
+        
+        ESP_LOGI(TAG, "在状态栏显示OTA进度: %d%%", progress);
+        return true;
+    }
+    
+    return false;
 }
