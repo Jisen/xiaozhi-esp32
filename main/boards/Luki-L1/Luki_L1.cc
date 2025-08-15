@@ -11,6 +11,8 @@
 #include "power_save_timer.h"
 #include "axp2101.h"
 #include "assets/lang_config.h"
+#include "luki_mqtt_service.h"
+#include "device_state_event.h"
 
 #include <esp_log.h>
 #include <driver/gpio.h>
@@ -141,6 +143,7 @@ private:
     esp_lcd_panel_io_handle_t panel_io_ = nullptr;
     esp_lcd_panel_handle_t panel_ = nullptr;
     customDisplay* display_;
+    std::unique_ptr<LukiMqttService> mqtt_service_;
 
     // anim::EmojiWidget* display_ = nullptr;
     Pmic* pmic_ = nullptr;
@@ -161,6 +164,12 @@ private:
         power_save_timer_ = new PowerSaveTimer(-1, 60, -1);
         power_save_timer_->OnEnterSleepMode([this]() {
             ESP_LOGI(TAG, "Enabling sleep mode");
+            
+            // 停止 MQTT 服务
+            if (mqtt_service_) {
+                mqtt_service_->Stop();
+            }
+            
             // if (!modem_.Command("AT+MLPMCFG=\"sleepmode\",2,0")) {
             //     ESP_LOGE(TAG, "Failed to enable module sleep mode");
             // }
@@ -175,14 +184,23 @@ private:
             display->SetChatMessage("system", "");
             display->SetEmotion("neutral");
             GetBacklight()->RestoreBrightness();
+            
+            // 恢复 MQTT 服务
+            if (mqtt_service_) {
+                mqtt_service_->Resume();
+            }
         });
         power_save_timer_->OnShutdownRequest([this]() {
             ESP_LOGI(TAG, "Shutting down");
+            
+            if (mqtt_service_) {
+                mqtt_service_->PublishDeviceMessageAsync("device_status", "DEVICE_SHUTDOWN");
+                vTaskDelay(pdMS_TO_TICKS(1000));  // 等待发布完成
+            }
+            
             pmic_->closeAldo2();
             Disable4GModule();
             DisableLeftButton();
-            // vTaskDelay(pdMS_TO_TICKS(500));
-
             pmic_->PowerOff();
             vTaskDelay(pdMS_TO_TICKS(500));
         });
@@ -190,14 +208,14 @@ private:
         power_save_timer_->SetEnabled(true);
     }
 
-    #ifdef LED_EN
+#ifdef LED_EN
     void InitializeLedPower() {
         // 设置GPIO模式
         gpio_reset_pin(BUILTIN_LED_POWER);
         gpio_set_direction(BUILTIN_LED_POWER, GPIO_MODE_OUTPUT);
         gpio_set_level(BUILTIN_LED_POWER, BUILTIN_LED_POWER_OUTPUT_INVERT ? 0 : 1);
     }
-    #endif
+#endif
 
     void Enable4GModule() {
        // 设置GPIO模式
@@ -224,7 +242,7 @@ private:
        gpio_set_level(VIBRATOR_GPIO, 0);
 
     }
-    #ifdef TOUCH_EN
+#ifdef TOUCH_EN
         /* Touch buttons handle */
      touch_button_handle_t button_handle[TOUCH_BUTTON_NUM];
 
@@ -250,7 +268,7 @@ private:
         // if (out_message->event == TOUCH_BUTTON_EVT_ON_PRESS) {
         //     ESP_LOGI(TAG, "Button[%d] Press", (int)arg);
         //     instance->power_save_timer_->WakeUp();
-        //     // instance->display_->ShowNotification(">(_︶_)<");
+        //     // instance->display_->ShowNotification(">(>_︶_)<");
         // } else 
         if (out_message->event == TOUCH_BUTTON_EVT_ON_RELEASE) {
             ESP_LOGI(TAG, "Button[%d] Release", (int)arg);
@@ -313,7 +331,7 @@ private:
         ESP_LOGI(TAG, "Touch element library start");
     }
 
-    #endif
+#endif
  
 
     void EnableAudioOut() {
@@ -371,23 +389,23 @@ private:
         panel_config.rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB;
         panel_config.bits_per_pixel = 16;
 
-        #ifdef CONFIG_LCD_GC9D01
+#ifdef CONFIG_LCD_GC9D01
         ESP_ERROR_CHECK(esp_lcd_new_panel_gc9d01n(panel_io, &panel_config, &panel));
-        #elif defined(CONFIG_LCD_NV3007)
+#elif defined(CONFIG_LCD_NV3007)
         ESP_ERROR_CHECK(esp_lcd_new_panel_nv3007(panel_io, &panel_config, &panel));
-        #endif
+#endif
         
 
         esp_lcd_panel_reset(panel);
         esp_lcd_panel_init(panel);
         esp_lcd_panel_invert_color(panel, false);
-        #ifdef CONFIG_LCD_GC9D01
+#ifdef CONFIG_LCD_GC9D01
         // esp_lcd_panel_swap_xy(panel, true);
         // esp_lcd_panel_mirror(panel, true, true);
-        #elif defined(CONFIG_LCD_NV3007)
+#elif defined(CONFIG_LCD_NV3007)
         esp_lcd_panel_swap_xy(panel, DISPLAY_SWAP_XY);
         esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
-        #endif
+#endif
 
 
         esp_lcd_panel_disp_on_off(panel, true);
@@ -396,9 +414,9 @@ private:
             DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY );
         // display_ = new anim::EmojiWidget(panel, panel_io);
                          
-    #ifdef CONFIG_LCD_GC9D01
+#ifdef CONFIG_LCD_GC9D01
     lv_disp_set_rotation(NULL, LV_DISP_ROTATION_270);
-    #endif
+#endif
     }
 
     void InitializeCodecI2c() {
@@ -433,48 +451,52 @@ private:
             right_button_long_pressed_ = false;
         });
 
+        // 左键事件处理
+        left_button_.OnPressDown([this]() {
+            power_save_timer_->WakeUp();
+            left_button_pressed_ = true;
+        });
+        
+        left_button_.OnPressUp([this]() {
+            power_save_timer_->WakeUp();
+            left_button_long_pressed_ = false;
+            left_button_pressed_ = false;
+        });
+
+        left_button_.OnLongPress([this]() {
+            power_save_timer_->WakeUp();
+            left_button_long_pressed_ = true;
+            CheckDualButtonPowerOff();
+        });
+
         // 右键长按处理
         right_button_.OnLongPress([this]() {
             power_save_timer_->WakeUp();
             right_button_long_pressed_ = true;
-            
-            // 检查是否两个按钮都被长按
-            if (left_button_long_pressed_ && right_button_long_pressed_) {
-                ExecutePowerOff();
-            }
-        });
-
-        // 左键按下处理
-        left_button_.OnPressDown([this]() {
-            power_save_timer_->WakeUp();
-            left_button_pressed_ = true;  // 设置左键按下状态
-        });
-        
-        // 左键松开处理
-        left_button_.OnPressUp([this]() {
-            power_save_timer_->WakeUp();
-            // 松开左键时重置状态
-            left_button_long_pressed_ = false;
-            left_button_pressed_ = false;  // 重置左键按下状态
-        });
-
-        // 左键长按处理
-        left_button_.OnLongPress([this]() {
-            power_save_timer_->WakeUp();
-            left_button_long_pressed_ = true;
-            
-            // 检查是否两个按钮都被长按
-            if (left_button_long_pressed_ && right_button_long_pressed_) {
-                ExecutePowerOff();
-            }
+            CheckDualButtonPowerOff();
         });
     }
 
-    // 提取关机逻辑到单独函数
+    // 检查双键长按关机
+    void CheckDualButtonPowerOff() {
+        if (left_button_long_pressed_ && right_button_long_pressed_) {
+            ExecutePowerOff();
+        }
+    }
+
+    // 手动关机处理
     void ExecutePowerOff() {
-        ESP_LOGI(TAG, "PowerOff - Both buttons long pressed");
+        ESP_LOGI(TAG, "Manual power off triggered");
+        
+        if (mqtt_service_) {
+            mqtt_service_->PublishDeviceMessageAsync("device_status", "DEVICE_MANUAL_SHUTDOWN");
+            vTaskDelay(pdMS_TO_TICKS(1000));  // 等待发布完成
+        }
+        
         auto display = GetDisplay();
         display->SetEmotion("sleepy");
+        
+        // 震动反馈
         gpio_set_level(VIBRATOR_GPIO, 1);
         vTaskDelay(pdMS_TO_TICKS(100));
         gpio_set_level(VIBRATOR_GPIO, 0);
@@ -485,16 +507,75 @@ private:
         pmic_->PowerOff();
     }
 
+
+
     // 物联网初始化，添加对 AI 可见设备
     void InitializeIot() {
-        #if CONFIG_IOT_PROTOCOL_XIAOZHI
+#if CONFIG_IOT_PROTOCOL_XIAOZHI
         auto& thing_manager = iot::ThingManager::GetInstance();
         thing_manager.AddThing(iot::CreateThing("Speaker"));
         thing_manager.AddThing(iot::CreateThing("Battery"));
         thing_manager.AddThing(iot::CreateThing("Screen"));
-    #elif CONFIG_IOT_PROTOCOL_MCP
+#elif CONFIG_IOT_PROTOCOL_MCP
          
-    #endif
+#endif
+    }
+
+    // MQTT 服务初始化
+    void InitializeLukiMqtt() {
+        mqtt_service_ = std::make_unique<LukiMqttService>();
+        
+        // 延迟启动 MQTT 服务，避免阻塞主线程
+        xTaskCreate([](void* arg) {
+            auto* self = static_cast<Luki_L1*>(arg);
+            vTaskDelay(pdMS_TO_TICKS(5000));  // 等待网络就绪
+            
+            ESP_LOGI(TAG, "Starting MQTT service...");
+            self->mqtt_service_->Start();
+            
+            vTaskDelay(pdMS_TO_TICKS(2000));  // 等待连接稳定
+            self->mqtt_service_->PublishStatusAsync();
+            
+            vTaskDelete(nullptr);
+        }, "mqtt_init", 4096, this, 3, nullptr);
+        
+        RegisterSessionStateCallback();
+    }
+
+        // 注册设备状态变化回调
+    void RegisterSessionStateCallback() {
+        auto& event_manager = DeviceStateEventManager::GetInstance();
+        event_manager.RegisterStateChangeCallback([this](DeviceState previous_state, DeviceState current_state) {
+            if (!mqtt_service_) return;
+            
+            // 会话开始检测
+            if (previous_state == kDeviceStateIdle && 
+                (current_state == kDeviceStateListening || current_state == kDeviceStateConnecting)) {
+                
+                std::string message = (current_state == kDeviceStateConnecting) ? 
+                    "SESSION_CONNECTING" : "SESSION_LISTENING";
+                
+                ESP_LOGI(TAG, "会话开始: %s", message.c_str());
+                mqtt_service_->PublishDeviceMessageAsync("session_status", message);
+            }
+            
+            // 会话状态变化
+            else if (current_state == kDeviceStateSpeaking && previous_state == kDeviceStateListening) {
+                ESP_LOGI(TAG, "开始说话");
+                mqtt_service_->PublishDeviceMessageAsync("session_status", "SESSION_SPEAKING");
+            }
+            
+            // 会话结束检测
+            else if (current_state == kDeviceStateIdle && 
+                     (previous_state == kDeviceStateSpeaking || previous_state == kDeviceStateListening)) {
+                
+                std::string message = (previous_state == kDeviceStateSpeaking) ? 
+                    "SESSION_ENDED_AFTER_SPEAKING" : "SESSION_ENDED_AFTER_LISTENING";
+                
+                ESP_LOGI(TAG, "会话结束: %s", message.c_str());
+                mqtt_service_->PublishDeviceMessageAsync("session_status", message);
+            }
+        });
     }
 
 public:
@@ -516,23 +597,18 @@ public:
         InitializeLedPower();
 #endif
 
-        // if(gpio_get_level(RIGHT_BUTTON_GPIO)!=0)
-        // {
-        //    pmic_->closeAldo2();
-        //    DisableLeftButton();
-        //    pmic_->PowerOff();
-        //    vTaskDelay(pdMS_TO_TICKS(3000 ));
-        // }
+
 
         InitializeButtons();
         EnableLeftButton() ;
         
         InitializeIot();
         GetBacklight()->RestoreBrightness();
-    #ifdef TOUCH_EN
+#ifdef TOUCH_EN
         InitTouch();
-    #endif
+#endif
 
+        InitializeLukiMqtt();
     }
 #ifdef LED_EN
     virtual Led* GetLed() override {
@@ -542,10 +618,9 @@ public:
     #endif
 
     virtual AudioCodec* GetAudioCodec() override {
-        // static NoAudioCodecSimplex audio_codec(AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
         static CustomAudioCodec audio_codec(AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
-
-            AUDIO_I2S_SPK_GPIO_BCLK, AUDIO_I2S_SPK_GPIO_LRCK, AUDIO_I2S_SPK_GPIO_DOUT, AUDIO_I2S_MIC_GPIO_SCK, AUDIO_I2S_MIC_GPIO_WS, AUDIO_I2S_MIC_GPIO_DIN);
+            AUDIO_I2S_SPK_GPIO_BCLK, AUDIO_I2S_SPK_GPIO_LRCK, AUDIO_I2S_SPK_GPIO_DOUT, 
+            AUDIO_I2S_MIC_GPIO_SCK, AUDIO_I2S_MIC_GPIO_WS, AUDIO_I2S_MIC_GPIO_DIN);
         return &audio_codec;
     }
 
