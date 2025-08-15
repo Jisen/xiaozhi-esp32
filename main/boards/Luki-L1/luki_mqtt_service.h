@@ -16,8 +16,8 @@ enum class MqttMessageType {
 
 struct MqttQueueMessage {
     MqttMessageType type;
-    std::string message_type;    // device_status, session_status 等
-    std::string data;           // JSON 字符串
+    char message_type[32];      // device_status, session_status 等
+    char data[512];             // JSON 字符串或简单消息
 };
 
 class Mqtt;

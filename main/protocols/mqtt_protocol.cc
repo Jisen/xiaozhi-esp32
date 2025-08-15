@@ -7,6 +7,7 @@
 #include <cstring>
 #include <arpa/inet.h>
 #include "assets/lang_config.h"
+#include "boards/Luki-L1/goodbye_event.h"
 
 #define TAG "MQTT"
 
@@ -74,6 +75,8 @@ bool MqttProtocol::StartMqttClient(bool report_error) {
             if (session_id == nullptr || session_id_ == session_id->valuestring) {
                 Application::GetInstance().Schedule([this]() {
                     CloseAudioChannel();
+                    // 通知goodbye事件
+                    GoodbyeEventManager::GetInstance().NotifyGoodbye();
                 });
             }
         } else if (on_incoming_json_ != nullptr) {

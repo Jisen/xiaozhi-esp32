@@ -9,6 +9,10 @@
 #include <esp_timer.h>
 #include <esp_efuse.h>
 #include <esp_efuse_table.h>
+#include <string.h>
+// #include <algorithm>
+// #include <time.h>
+// #include <sys/time.h>
 
 static const char* TAG = "LukiMqtt";
 
@@ -16,21 +20,45 @@ LukiMqttService::LukiMqttService() {
 }
 
 LukiMqttService::~LukiMqttService() {
-    if (task_handle_) {
-        vTaskDelete(task_handle_);
-        task_handle_ = nullptr;
-    }
-    if (publish_queue_) {
-        vQueueDelete(publish_queue_);
+    ESP_LOGI(TAG, "Destroying MQTT service...");
+    
+    // 如果还有任务和队列没有被Stop()清理，现在清理
+    if (task_handle_ || publish_queue_) {
+        ESP_LOGW(TAG, "Stop() was not called, cleaning up now...");
+        
+        // 先标记队列为无效，防止任务继续使用
+        QueueHandle_t temp_queue = publish_queue_;
         publish_queue_ = nullptr;
+        
+        // 删除任务
+        if (task_handle_) {
+            vTaskDelete(task_handle_);
+            task_handle_ = nullptr;
+            vTaskDelay(pdMS_TO_TICKS(100));  // 等待任务完全停止
+        }
+        
+        // 删除队列
+        if (temp_queue) {
+            vQueueDelete(temp_queue);
+        }
     }
+    
     luki_mqtt_.reset();
+    ESP_LOGI(TAG, "MQTT service destroyed");
 }
 
 void LukiMqttService::Start() {
     // 使用编译时配置常量
     endpoint_ = LUKI_MQTT_ENDPOINT;
-    client_id_ = std::string(LUKI_MQTT_CLIENT_ID_PREFIX);
+    // 生成唯一的Client ID: 前缀 + 完整MAC地址(去除冒号) + 启动时间戳
+    std::string mac_clean = SystemInfo::GetMacAddress();
+    // 移除MAC地址中的冒号
+    mac_clean.erase(std::remove(mac_clean.begin(), mac_clean.end(), ':'), mac_clean.end());
+    
+    // 获取启动时间戳作为唯一标识
+    uint32_t boot_time = esp_timer_get_time() / 1000000;  // 转换为秒
+    
+    client_id_ = std::string(LUKI_MQTT_CLIENT_ID_PREFIX) + mac_clean + "_" + std::to_string(boot_time);
     username_ = LUKI_MQTT_USERNAME;
     password_ = LUKI_MQTT_PASSWORD;
     int keepalive = LUKI_MQTT_KEEPALIVE;
@@ -82,19 +110,79 @@ void LukiMqttService::Stop() {
     
     // 发布离线状态
     if (luki_mqtt_ && luki_mqtt_->IsConnected()) {
-        ESP_LOGI(TAG, "Publishing offline status before sleep");
-        std::string sleep_message = CreateDeviceMessageJson("device_status", "DEVICE_SLEEPING");
-        luki_mqtt_->Publish("luki/device", sleep_message);
-        vTaskDelay(pdMS_TO_TICKS(500));  // 等待发布完成
+        // ESP_LOGI(TAG, "Publishing offline status before sleep");
+        // std::string sleep_message = CreateDeviceMessageJson("device_status", "DEVICE_SLEEPING");
+        // luki_mqtt_->Publish("luki/device", sleep_message);
+        // vTaskDelay(pdMS_TO_TICKS(500));  // 等待发布完成
         
         // 断开连接
         luki_mqtt_->Disconnect();
         ESP_LOGI(TAG, "MQTT connection closed for sleep");
     }
+    
+    // 既然连接关闭了，任务也应该停止以节省资源
+    if (task_handle_) {
+        ESP_LOGI(TAG, "Stopping MQTT task for sleep...");
+        
+        // 先标记队列为无效，让任务安全退出
+        QueueHandle_t temp_queue = publish_queue_;
+        publish_queue_ = nullptr;
+        
+        // 等待任务自然退出（最多等待3秒）
+        bool task_ended = false;
+        for (int i = 0; i < 30; i++) {
+            if (eTaskGetState(task_handle_) == eDeleted) {
+                task_ended = true;
+                break;
+            }
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        
+        if (task_ended) {
+            ESP_LOGI(TAG, "MQTT task exited gracefully");
+        } else {
+            ESP_LOGW(TAG, "Task didn't exit gracefully after 3s, force deleting...");
+            vTaskDelete(task_handle_);
+        }
+        
+        task_handle_ = nullptr;
+        
+        // 清理队列
+        if (temp_queue) {
+            vQueueDelete(temp_queue);
+        }
+        
+        ESP_LOGI(TAG, "MQTT task and queue cleaned up for sleep");
+    }
 }
 
 void LukiMqttService::Resume() {
     ESP_LOGI(TAG, "Resuming MQTT service from sleep mode...");
+    
+    // 如果任务和队列在睡眠时被清理了，需要重新创建
+    if (!task_handle_ || !publish_queue_) {
+        ESP_LOGI(TAG, "Recreating MQTT task and queue after sleep...");
+        
+        // 重新创建发布队列
+        if (!publish_queue_) {
+            publish_queue_ = xQueueCreate(5, sizeof(MqttQueueMessage));
+            if (!publish_queue_) {
+                ESP_LOGE(TAG, "Failed to recreate publish queue");
+                return;
+            }
+        }
+        
+        // 重新创建任务
+        if (!task_handle_) {
+            BaseType_t task_result = xTaskCreate(&LukiMqttService::TaskEntry, "LukiMqtt", 4096, this, 5, &task_handle_);
+            if (task_result != pdPASS) {
+                ESP_LOGE(TAG, "Failed to recreate MQTT task");
+                return;
+            }
+        }
+        
+        ESP_LOGI(TAG, "MQTT task and queue recreated successfully");
+    }
     
     if (luki_mqtt_) {
         // 重新连接
@@ -110,7 +198,14 @@ void LukiMqttService::Resume() {
 }
 
 void LukiMqttService::TaskEntry(void* arg) {
-    static_cast<LukiMqttService*>(arg)->TaskLoop();
+    LukiMqttService* service = static_cast<LukiMqttService*>(arg);
+    if (service) {
+        service->TaskLoop();
+    }
+    
+    // 任务即将结束，确保不再访问任何成员变量
+    ESP_LOGI(TAG, "MQTT task entry ending");
+    vTaskDelete(nullptr);  // 主动删除自己，确保任务完全结束
 }
 
 bool LukiMqttService::EnsureConnected() {
@@ -160,22 +255,6 @@ bool LukiMqttService::EnsureConnected() {
         if (!connect_result) {
             ESP_LOGE(TAG, "MQTT connect failed - broker=%s:%d, client_id=%s", 
                     broker_address.c_str(), broker_port, client_id_.c_str());
-            
-            // 尝试连接到公共测试服务器进行对比
-            ESP_LOGI(TAG, "Testing connection to public MQTT broker...");
-            std::string test_broker = "test.mosquitto.org";
-            int test_port = 1883;
-            bool test_result = luki_mqtt_->Connect(test_broker, test_port, client_id_, "", "");
-            
-            if (test_result) {
-                ESP_LOGW(TAG, "Public MQTT broker works! Your server %s:%d might be blocked", 
-                        broker_address.c_str(), broker_port);
-                // 重新连接回原服务器
-                luki_mqtt_->Connect(broker_address, broker_port, client_id_, username_, password_);
-            } else {
-                ESP_LOGE(TAG, "Even public MQTT broker failed - network issue?");
-            }
-            
             return false;
         }
         
@@ -198,21 +277,35 @@ void LukiMqttService::TaskLoop() {
     ESP_LOGI(TAG, "Initial connection result: %s", initial_connected ? "SUCCESS" : "FAILED");
     
     while (true) {
+        // 检查队列是否仍然有效（防止析构时的竞态条件）
+        if (!publish_queue_) {
+            ESP_LOGW(TAG, "Queue is null, task exiting");
+            break;
+        }
+        
         MqttQueueMessage queue_msg;
         
         // 等待异步消息，超时1秒
         if (xQueueReceive(publish_queue_, &queue_msg, pdMS_TO_TICKS(1000)) == pdTRUE) {
-            ESP_LOGD(TAG, "Processing message: %s", queue_msg.message_type.c_str());
+            ESP_LOGD(TAG, "Processing message: %s", queue_msg.message_type);
             
             if (EnsureConnected()) {
                 if (queue_msg.type == MqttMessageType::STATUS_PUBLISH) {
                     PublishStatusOnce();
                 } else if (queue_msg.type == MqttMessageType::DEVICE_MESSAGE) {
-                    PublishDeviceMessage(queue_msg.message_type, queue_msg.data);
+                    PublishDeviceMessage(std::string(queue_msg.message_type), std::string(queue_msg.data));
                 }
             }
         }
+        
+        // 再次检查队列有效性
+        if (!publish_queue_) {
+            ESP_LOGW(TAG, "Queue became null during operation, task exiting");
+            break;
+        }
     }
+    
+    ESP_LOGI(TAG, "MQTT task ended");
 }
 
 bool LukiMqttService::PublishStatusOnce() {
@@ -242,8 +335,8 @@ void LukiMqttService::PublishStatusAsync() {
     
     MqttQueueMessage msg;
     msg.type = MqttMessageType::STATUS_PUBLISH;
-    msg.message_type = "device_status";
-    msg.data = "";
+    snprintf(msg.message_type, sizeof(msg.message_type), "device_status");
+    msg.data[0] = '\0';  // 空字符串
     
     if (xQueueSend(publish_queue_, &msg, 0) != pdTRUE) {
         ESP_LOGW(TAG, "Failed to queue status message");
@@ -264,13 +357,18 @@ void LukiMqttService::PublishDeviceMessageAsync(const std::string& type, const c
         return;
     }
 
+    // 检查消息长度
+    std::string json_str(json_string);
+    if (json_str.length() >= sizeof(((MqttQueueMessage*)0)->data)) {
+        ESP_LOGW(TAG, "Message too long (%d bytes), truncating", (int)json_str.length());
+    }
+
     MqttQueueMessage msg;
     msg.type = MqttMessageType::DEVICE_MESSAGE;
-    msg.message_type = type;
-    msg.data = std::string(json_string);
+    snprintf(msg.message_type, sizeof(msg.message_type), "%s", type.c_str());
+    snprintf(msg.data, sizeof(msg.data), "%s", json_string);
     free(json_string);
 
-    // 非阻塞发送，如果队列满则丢弃
     if (xQueueSend(publish_queue_, &msg, 0) != pdTRUE) {
         ESP_LOGW(TAG, "Failed to queue device message: %s", type.c_str());
     }
@@ -282,12 +380,16 @@ void LukiMqttService::PublishDeviceMessageAsync(const std::string& type, const s
         return;
     }
 
+    // 检查消息长度
+    if (simple_message.length() >= sizeof(((MqttQueueMessage*)0)->data)) {
+        ESP_LOGW(TAG, "Message too long (%d bytes), truncating", (int)simple_message.length());
+    }
+
     MqttQueueMessage msg;
     msg.type = MqttMessageType::DEVICE_MESSAGE;
-    msg.message_type = type;
-    msg.data = simple_message;
+    snprintf(msg.message_type, sizeof(msg.message_type), "%s", type.c_str());
+    snprintf(msg.data, sizeof(msg.data), "%s", simple_message.c_str());
 
-    // 非阻塞发送，如果队列满则丢弃
     if (xQueueSend(publish_queue_, &msg, 0) != pdTRUE) {
         ESP_LOGW(TAG, "Failed to queue device message: %s", type.c_str());
     }
@@ -301,11 +403,17 @@ bool LukiMqttService::PublishDeviceMessage(const std::string& type, const std::s
 
     std::string full_message = CreateDeviceMessageJson(type, data);
     if (full_message.empty()) {
+        ESP_LOGE(TAG, "Failed to create device message JSON");
         return false;
     }
 
-    ESP_LOGI(TAG, "发布设备消息 [%s]: %s", type.c_str(), full_message.c_str());
-    return luki_mqtt_->Publish("luki/device", full_message);
+    ESP_LOGI(TAG, "发布设备消息 [%s] 到 %s", type.c_str(), endpoint_.c_str());
+    ESP_LOGD(TAG, "消息内容: %s", full_message.c_str());
+    
+    bool result = luki_mqtt_->Publish("luki/device", full_message);
+    ESP_LOGI(TAG, "发布结果: %s", result ? "✅成功" : "❌失败");
+    
+    return result;
 }
 
 std::string LukiMqttService::CreateDeviceMessageJson(const std::string& type, const std::string& data) {
@@ -323,15 +431,18 @@ std::string LukiMqttService::CreateDeviceMessageJson(const std::string& type, co
         cJSON_AddStringToObject(json, "serial_number", serial_number.c_str());
     }
     
-    cJSON_AddNumberToObject(json, "timestamp", esp_timer_get_time() / 1000000);
+    // cJSON_AddNumberToObject(json, "timestamp", (double)GetCurrentTimestamp());
     cJSON_AddStringToObject(json, "type", type.c_str());
 
     // 添加消息内容
     if (!data.empty()) {
+        ESP_LOGD(TAG, "Processing message data: %s", data.c_str());
         cJSON* parsed_data = cJSON_Parse(data.c_str());
         if (parsed_data) {
+            ESP_LOGD(TAG, "Successfully parsed data as JSON object");
             cJSON_AddItemToObject(json, "message", parsed_data);
         } else {
+            ESP_LOGW(TAG, "Failed to parse data as JSON, treating as string");
             cJSON_AddStringToObject(json, "message", data.c_str());
         }
     } else {
@@ -347,6 +458,24 @@ std::string LukiMqttService::CreateDeviceMessageJson(const std::string& type, co
     
     return result;
 }
+
+// time_t LukiMqttService::GetCurrentTimestamp() {
+//     time_t now = time(NULL);
+//     struct tm* tm_info = localtime(&now);
+    
+//     // 检查系统时间是否已设置（年份大于2024）
+//     if (tm_info->tm_year >= 2024 - 1900) {
+//         // 使用真实的Unix时间戳
+//         return now;
+//     } else {
+//         // 系统时间未设置，使用启动时间 + 一个基准时间戳
+//         // 2024-01-01 00:00:00 UTC = 1704067200
+//         time_t estimated_time = 1704067200 + (esp_timer_get_time() / 1000000);
+//         ESP_LOGW(TAG, "System time not set (year: %d), using estimated timestamp: %ld", 
+//                  tm_info->tm_year + 1900, estimated_time);
+//         return estimated_time;
+//     }
+// }
 
 std::string LukiMqttService::GetSerialNumber() {
     std::string serial_number;

@@ -21,7 +21,7 @@
 #endif
 
 #ifndef LUKI_MQTT_STATUS_TOPIC
-#define LUKI_MQTT_STATUS_TOPIC "luki/status"  // 使用独特的主题避免冲突
+#define LUKI_MQTT_STATUS_TOPIC "luki/device"  // 使用独特的主题避免冲突
 #endif
 
 #ifndef LUKI_MQTT_STATUS_INTERVAL

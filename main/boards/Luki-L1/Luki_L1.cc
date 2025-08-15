@@ -13,6 +13,7 @@
 #include "assets/lang_config.h"
 #include "luki_mqtt_service.h"
 #include "device_state_event.h"
+#include "goodbye_event.h"
 
 #include <esp_log.h>
 #include <driver/gpio.h>
@@ -192,11 +193,16 @@ private:
         });
         power_save_timer_->OnShutdownRequest([this]() {
             ESP_LOGI(TAG, "Shutting down");
-            
+
+            // 停止 MQTT 服务
             if (mqtt_service_) {
-                mqtt_service_->PublishDeviceMessageAsync("device_status", "DEVICE_SHUTDOWN");
-                vTaskDelay(pdMS_TO_TICKS(1000));  // 等待发布完成
+                mqtt_service_->Stop();
             }
+            
+            // if (mqtt_service_) {
+            //     mqtt_service_->PublishDeviceMessageAsync("device_status", "DEVICE_SHUTDOWN");
+            //     vTaskDelay(pdMS_TO_TICKS(1000));  // 等待发布完成
+            // }
             
             pmic_->closeAldo2();
             Disable4GModule();
@@ -488,10 +494,10 @@ private:
     void ExecutePowerOff() {
         ESP_LOGI(TAG, "Manual power off triggered");
         
-        if (mqtt_service_) {
-            mqtt_service_->PublishDeviceMessageAsync("device_status", "DEVICE_MANUAL_SHUTDOWN");
-            vTaskDelay(pdMS_TO_TICKS(1000));  // 等待发布完成
-        }
+        // if (mqtt_service_) {
+        //     mqtt_service_->PublishDeviceMessageAsync("device_status", "DEVICE_MANUAL_SHUTDOWN");
+        //     vTaskDelay(pdMS_TO_TICKS(1000));  // 等待发布完成
+        // }
         
         auto display = GetDisplay();
         display->SetEmotion("sleepy");
@@ -539,7 +545,8 @@ private:
             vTaskDelete(nullptr);
         }, "mqtt_init", 4096, this, 3, nullptr);
         
-        RegisterSessionStateCallback();
+        // RegisterSessionStateCallback();
+        RegisterProtocolCallbacks();
     }
 
         // 注册设备状态变化回调
@@ -570,12 +577,27 @@ private:
                      (previous_state == kDeviceStateSpeaking || previous_state == kDeviceStateListening)) {
                 
                 std::string message = (previous_state == kDeviceStateSpeaking) ? 
-                    "SESSION_ENDED_AFTER_SPEAKING" : "SESSION_ENDED_AFTER_LISTENING";
+                    "SESSION_ENDED_AFTER_SPEAKING" : "SESSION_IDLE";
                 
                 ESP_LOGI(TAG, "会话结束: %s", message.c_str());
                 mqtt_service_->PublishDeviceMessageAsync("session_status", message);
             }
         });
+    }
+
+    // 注册goodbye事件回调
+    void RegisterProtocolCallbacks() {
+        ESP_LOGI(TAG, "注册goodbye事件监听...");
+        
+        GoodbyeEventManager::GetInstance().RegisterGoodbyeCallback([this]() {
+            ESP_LOGI(TAG, "🎯 收到goodbye事件 - 会话结束");
+            
+            if (mqtt_service_) {
+                mqtt_service_->PublishDeviceMessageAsync("session_status", "SESSION_ENDED_BY_GOODBYE");
+            }
+        });
+        
+        ESP_LOGI(TAG, "✅ goodbye事件监听已注册");
     }
 
 public:
